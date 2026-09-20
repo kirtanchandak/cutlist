@@ -19,10 +19,13 @@ interface DownloadStatus {
   progress: number;
 }
 
+import { supabase } from "../lib/supabase";
+
 interface PhonePreviewProps {
   clip: Clip | null;
   videoId: string;
   dlStatus: DownloadStatus;
+  totalDuration: number;
 }
 
 function formatTime(seconds: number): string {
@@ -31,17 +34,23 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export function PhonePreview({ clip, videoId, dlStatus }: PhonePreviewProps) {
+export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePreviewProps) {
   const [aspectRatio, setAspectRatio] = useState<"9:16" | "1:1" | "16:9">("9:16");
   const [exporting, setExporting] = useState(false);
   const [exportDone, setExportDone] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
+  const isTooLong = totalDuration > 600;
+
   async function handleExport() {
-    if (!clip || dlStatus.status !== "ready") return;
+    if (!clip || (dlStatus.status !== "ready" && !isTooLong)) return;
     setExporting(true);
     setExportError(null);
     try {
+      // Analytics: Track export
+      supabase.from("clip_exports").insert([{ video_id: videoId, aspect_ratio: aspectRatio }]).then(({ error }) => {
+        if (error) console.error(error);
+      });
       const res = await fetch("/api/clip-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -149,7 +158,7 @@ export function PhonePreview({ clip, videoId, dlStatus }: PhonePreviewProps) {
       </div>
 
       {/* Background Download Status */}
-      {dlStatus.status === "downloading" && (
+      {!isTooLong && dlStatus.status === "downloading" && (
         <div className="mb-3 text-xs">
           <div className="flex justify-between text-[var(--mu)] mb-1">
             <span>Downloading high-res video...</span>
@@ -164,7 +173,7 @@ export function PhonePreview({ clip, videoId, dlStatus }: PhonePreviewProps) {
         </div>
       )}
       
-      {dlStatus.status === "error" && (
+      {!isTooLong && dlStatus.status === "error" && (
         <p className="text-xs text-red-500 mb-3">Background download failed.</p>
       )}
 
@@ -173,12 +182,17 @@ export function PhonePreview({ clip, videoId, dlStatus }: PhonePreviewProps) {
       )}
 
       {/* Export clip */}
+      {isTooLong && (
+        <p className="text-xs text-amber-600 dark:text-amber-500 mb-3 text-center">
+          Video is over 10 mins. Pre-downloading is disabled for long videos. You can still browse JEV clips above.
+        </p>
+      )}
       <button
         onClick={handleExport}
-        disabled={exporting || dlStatus.status !== "ready"}
+        disabled={isTooLong || exporting || dlStatus.status !== "ready"}
         className={clsx(
           "w-full rounded-lg py-2.5 text-sm font-semibold transition",
-          dlStatus.status !== "ready"
+          isTooLong || dlStatus.status !== "ready"
              ? "bg-[var(--ln)] text-[var(--mu)] cursor-not-allowed opacity-70"
              : exporting
              ? "bg-[var(--ln)] text-[var(--mu)] cursor-wait"
@@ -187,7 +201,9 @@ export function PhonePreview({ clip, videoId, dlStatus }: PhonePreviewProps) {
              : "bg-[var(--ink)] text-[var(--bg)] hover:bg-[var(--ac)] hover:text-[var(--acink)]"
         )}
       >
-        {dlStatus.status !== "ready" ? (
+        {isTooLong ? (
+          "Export disabled (> 10m)"
+        ) : dlStatus.status !== "ready" ? (
           "Preparing video..."
         ) : exporting ? (
           <span className="flex items-center justify-center gap-2">
