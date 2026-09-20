@@ -96,15 +96,6 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
     );
   }
 
-  // Build caption with highlight
-  const words = clip.hook.split(" ");
-  const captionHtml =
-    words.slice(0, 5).join(" ") +
-    ' <mark style="background:var(--mk);color:var(--mkink);padding:0 3px;border-radius:3px">' +
-    words.slice(5, 8).join(" ") +
-    "</mark> " +
-    words.slice(8).join(" ");
-
   const duration = clip.endSeconds - clip.startSeconds;
   const score = clip.viralityScore != null ? Math.round(clip.viralityScore * 100) : null;
 
@@ -115,29 +106,53 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
     <div className="panel p-5">
       {/* Phone/Video mockup */}
       <div 
-        className="relative mx-auto rounded-[22px] bg-gradient-to-br from-[#20306e] to-[#0d1330] overflow-hidden flex flex-col justify-end p-5 border-[6px] border-[var(--ink)] transition-all duration-300"
+        className="relative mx-auto rounded-[22px] bg-black overflow-hidden flex flex-col justify-end p-5 border-[6px] border-[var(--ink)] transition-all duration-300 shadow-xl"
         style={{ aspectRatio: previewAspect, width: aspectRatio === "16:9" ? "100%" : "auto", maxWidth: aspectRatio === "9:16" ? 220 : aspectRatio === "1:1" ? 260 : "100%" }}
       >
-        {/* Progress bar */}
-        <div className="absolute left-5 right-5 top-4 h-[3px] rounded-sm bg-white/20">
-          <div className="h-full w-[34%] rounded-sm bg-white" />
-        </div>
+        {/* YouTube Video Background */}
+        {clip && (
+          <div className="absolute inset-0 overflow-hidden select-none">
+            <iframe
+              key={`${clip.startSeconds}-${aspectRatio}`}
+              src={`https://www.youtube.com/embed/${videoId}?autoplay=1&controls=0&modestbranding=1&start=${Math.floor(clip.startSeconds)}&end=${Math.floor(clip.endSeconds)}&loop=1&playlist=${videoId}`}
+              allow="autoplay; encrypted-media"
+              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 border-0"
+              style={{
+                height: aspectRatio === "16:9" ? "auto" : "100%",
+                width: aspectRatio === "16:9" ? "100%" : "auto",
+                aspectRatio: "16/9",
+                minWidth: "100%",
+                minHeight: "100%"
+              }}
+            />
+          </div>
+        )}
 
-        {/* Caption */}
-        <div
-          className={clsx(
-            "font-extrabold leading-tight text-white tracking-tight",
-            aspectRatio === "9:16" ? "text-xl" : "text-sm"
-          )}
-          style={{ textShadow: "0 2px 8px rgba(0,0,0,.5)" }}
-          dangerouslySetInnerHTML={{ __html: captionHtml }}
-        />
+        {/* Progress bar */}
+        <div className="absolute z-10 left-5 right-5 top-4 h-[3px] rounded-sm bg-white/30 pointer-events-none">
+          <div className="h-full rounded-sm bg-white animate-pulse" style={{ width: '40%' }} />
+        </div>
       </div>
 
       {/* Why JEV picked it */}
-      <p className="text-sm text-[var(--mu)] mt-4 mb-4 leading-relaxed">
-        <strong>Why Jev picked it:</strong> {clip.reason}
-      </p>
+      <div className="mt-4 mb-4">
+        <div className="flex items-center justify-between mb-1">
+          <strong className="text-sm">Why Jev picked it:</strong>
+          {clip && (
+            <a 
+              href={`https://youtube.com/watch?v=${videoId}&t=${Math.floor(clip.startSeconds)}s`} 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="text-xs hover:text-[var(--ink)] hover:underline flex items-center gap-1 transition-colors text-[var(--ac)] dark:text-blue-400 font-medium"
+            >
+              Watch on YT ↗
+            </a>
+          )}
+        </div>
+        <p className="text-sm text-[var(--mu)] leading-relaxed">
+          {clip.reason}
+        </p>
+      </div>
 
       {/* Aspect Ratio Toggle */}
       <div className="mb-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg p-1 flex">
@@ -170,6 +185,13 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
               style={{ width: `${dlStatus.progress}%` }} 
             />
           </div>
+        </div>
+      )}
+      
+      {!isTooLong && dlStatus.status === "ready" && (
+        <div className="mb-3 text-xs flex justify-between items-center text-emerald-600 dark:text-emerald-500 font-medium bg-emerald-500/10 px-3 py-2 rounded-lg border border-emerald-500/20">
+          <span>High-res video downloaded</span>
+          <span>✓ Ready to export</span>
         </div>
       )}
       
@@ -219,7 +241,7 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
 
       {/* Score badge */}
       {score != null && (
-        <div className="mt-3 text-center text-xs text-[var(--mu)]">
+        <div className="mt-4 text-center text-xs text-[var(--mu)]">
           JEV score: <span className="font-semibold text-[var(--ink)]">{score}</span>
         </div>
       )}
