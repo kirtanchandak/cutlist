@@ -67,7 +67,8 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
 
   // Download polling
   useEffect(() => {
-    if (section !== 3 || !videoId || dlStatus.status === "ready" || dlStatus.status === "error") {
+    const downloadsDisabled = process.env.NEXT_PUBLIC_DISABLE_DOWNLOADS === "true";
+    if (downloadsDisabled || section !== 3 || !videoId || dlStatus.status === "ready" || dlStatus.status === "error") {
       return;
     }
 
@@ -137,9 +138,9 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         setTotalCost(cData.totalCost);
         setActiveClipIndex(0);
         setSection(3);
-        
-        // Trigger background download only if <= 10 mins
-        if (tData.totalDuration <= 600) {
+        // Trigger background download only if <= 10 mins and downloads are enabled
+        const downloadsDisabled = process.env.NEXT_PUBLIC_DISABLE_DOWNLOADS === "true";
+        if (tData.totalDuration <= 600 && !downloadsDisabled) {
           fetch("/api/prepare-video", {
             method: "POST",
             headers: { "Content-Type": "application/json" },

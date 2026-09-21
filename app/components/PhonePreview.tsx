@@ -114,7 +114,7 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
           <div className="absolute inset-0 overflow-hidden select-none">
             <iframe
               key={`${clip.startSeconds}-${aspectRatio}`}
-              src={`https://www.youtube.com/embed/${videoId}?autoplay=1&controls=0&modestbranding=1&start=${Math.floor(clip.startSeconds)}&end=${Math.floor(clip.endSeconds)}&loop=1&playlist=${videoId}`}
+              src={`https://www.youtube.com/embed/${videoId}?autoplay=1&controls=0&modestbranding=1&start=${Math.floor(clip.startSeconds)}&end=${Math.floor(clip.endSeconds)}&loop=1&playlist=${videoId}&cc_load_policy=3&iv_load_policy=3&cc_lang_pref=xx`}
               allow="autoplay; encrypted-media"
               className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 border-0"
               style={{
@@ -172,72 +172,77 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
         ))}
       </div>
 
-      {/* Background Download Status */}
-      {!isTooLong && dlStatus.status === "downloading" && (
-        <div className="mb-3 text-xs">
-          <div className="flex justify-between text-[var(--mu)] mb-1">
-            <span>Downloading high-res video...</span>
-            <span>{Math.round(dlStatus.progress)}%</span>
-          </div>
-          <div className="h-1.5 w-full bg-[var(--ln)] rounded-full overflow-hidden">
-            <div 
-              className="h-full bg-[var(--ac)] transition-all duration-300" 
-              style={{ width: `${dlStatus.progress}%` }} 
-            />
-          </div>
-        </div>
-      )}
-      
-      {!isTooLong && dlStatus.status === "ready" && (
-        <div className="mb-3 text-xs flex justify-between items-center text-emerald-600 dark:text-emerald-500 font-medium bg-emerald-500/10 px-3 py-2 rounded-lg border border-emerald-500/20">
-          <span>High-res video downloaded</span>
-          <span>✓ Ready to export</span>
-        </div>
-      )}
-      
-      {!isTooLong && dlStatus.status === "error" && (
-        <p className="text-xs text-red-500 mb-3">Background download failed.</p>
-      )}
+      {/* Download and Export UI */}
+      {process.env.NEXT_PUBLIC_DISABLE_DOWNLOADS !== "true" && (
+        <>
+          {/* Background Download Status */}
+          {!isTooLong && dlStatus.status === "downloading" && (
+            <div className="mb-3 text-xs">
+              <div className="flex justify-between text-[var(--mu)] mb-1">
+                <span>Downloading high-res video...</span>
+                <span>{Math.round(dlStatus.progress)}%</span>
+              </div>
+              <div className="h-1.5 w-full bg-[var(--ln)] rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-[var(--ac)] transition-all duration-300" 
+                  style={{ width: `${dlStatus.progress}%` }} 
+                />
+              </div>
+            </div>
+          )}
+          
+          {!isTooLong && dlStatus.status === "ready" && (
+            <div className="mb-3 text-xs flex justify-between items-center text-emerald-600 dark:text-emerald-500 font-medium bg-emerald-500/10 px-3 py-2 rounded-lg border border-emerald-500/20">
+              <span>High-res video downloaded</span>
+              <span>✓ Ready to export</span>
+            </div>
+          )}
+          
+          {!isTooLong && dlStatus.status === "error" && (
+            <p className="text-xs text-red-500 mb-3">Background download failed.</p>
+          )}
 
-      {exportError && (
-        <p className="text-xs text-red-500 mb-3">{exportError}</p>
-      )}
+          {exportError && (
+            <p className="text-xs text-red-500 mb-3">{exportError}</p>
+          )}
 
-      {/* Export clip */}
-      {isTooLong && (
-        <p className="text-xs text-amber-600 dark:text-amber-500 mb-3 text-center">
-          Video is over 10 mins. Pre-downloading is disabled for long videos. You can still browse JEV clips above.
-        </p>
+          {/* Export clip */}
+          {isTooLong && (
+            <p className="text-xs text-amber-600 dark:text-amber-500 mb-3 text-center">
+              Video is over 10 mins. Pre-downloading is disabled for long videos. You can still browse JEV clips above.
+            </p>
+          )}
+          <button
+            onClick={handleExport}
+            disabled={isTooLong || exporting || dlStatus.status !== "ready"}
+            className={clsx(
+              "w-full rounded-lg py-2.5 text-sm font-semibold transition",
+              isTooLong || dlStatus.status !== "ready"
+                 ? "bg-[var(--ln)] text-[var(--mu)] cursor-not-allowed opacity-70"
+                 : exporting
+                 ? "bg-[var(--ln)] text-[var(--mu)] cursor-wait"
+                 : exportDone
+                 ? "bg-emerald-600 text-white"
+                 : "bg-[var(--ink)] text-[var(--bg)] hover:bg-[var(--ac)] hover:text-[var(--acink)]"
+            )}
+          >
+            {isTooLong ? (
+              "Export disabled (> 10m)"
+            ) : dlStatus.status !== "ready" ? (
+              "Preparing video..."
+            ) : exporting ? (
+              <span className="flex items-center justify-center gap-2">
+                <Loader2 size={14} className="animate-spin" />
+                Exporting…
+              </span>
+            ) : exportDone ? (
+              "Downloaded ✓"
+            ) : (
+              `Export clip · ${duration}s`
+            )}
+          </button>
+        </>
       )}
-      <button
-        onClick={handleExport}
-        disabled={isTooLong || exporting || dlStatus.status !== "ready"}
-        className={clsx(
-          "w-full rounded-lg py-2.5 text-sm font-semibold transition",
-          isTooLong || dlStatus.status !== "ready"
-             ? "bg-[var(--ln)] text-[var(--mu)] cursor-not-allowed opacity-70"
-             : exporting
-             ? "bg-[var(--ln)] text-[var(--mu)] cursor-wait"
-             : exportDone
-             ? "bg-emerald-600 text-white"
-             : "bg-[var(--ink)] text-[var(--bg)] hover:bg-[var(--ac)] hover:text-[var(--acink)]"
-        )}
-      >
-        {isTooLong ? (
-          "Export disabled (> 10m)"
-        ) : dlStatus.status !== "ready" ? (
-          "Preparing video..."
-        ) : exporting ? (
-          <span className="flex items-center justify-center gap-2">
-            <Loader2 size={14} className="animate-spin" />
-            Exporting…
-          </span>
-        ) : exportDone ? (
-          "Downloaded ✓"
-        ) : (
-          `Export clip · ${duration}s`
-        )}
-      </button>
 
       {/* Score badge */}
       {score != null && (

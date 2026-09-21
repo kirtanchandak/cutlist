@@ -1,124 +1,225 @@
 import { OpenRouter } from "@openrouter/sdk";
 
+// Long videos mean hundreds of Jev calls. Give the function room to finish.
+export const maxDuration = 300;
+
 const JEV_MODEL = "~typesafe/jev-latest";
 
-// A parsed segment of the transcript
+const CFG = {
+  windowLengths: [30, 45, 60], // target clip lengths in seconds
+  snapTolerance: 10, // how far an end may move to land on a pause
+  minClipSeconds: 20,
+  maxClipSeconds: 75,
+  strideSeconds: 12, // gap between window starts (auto-widens on long videos)
+  maxWindows: 900, // cap on Jev calls per video
+  minWords: 35, // skip windows that are mostly silence or music
+  contextSeconds: 30,
+  contextChars: 600,
+  concurrency: 8,
+  budgetMs: 270_000, // stop scoring before the function timeout
+  maxClips: 6,
+  minScore: 0.55, // composite floor: weak videos return fewer clips
+  minWorthy: 0.3, // hard gate against sponsor reads, intros, dead air
+  overlapLimit: 0.25,
+  mergeGapSeconds: 2,
+} as const;
+
+const WEIGHTS = { hook: 0.35, standalone: 0.25, payoff: 0.25, worthy: 0.15 };
+const SCORE_LEVELS = 5; // each score question has 5 labels -> 0..4
+
+interface Entry {
+  seconds: number;
+  text: string;
+}
+
 interface Segment {
   text: string;
+  before: string;
+  after: string;
   startSeconds: number;
   endSeconds: number;
 }
 
-// What JEV tells us about each segment
 interface SegmentDecision {
   segment: Segment;
-  isClipWorthy: number;   // noul 0–1
-  contentType: string;    // choice: hook | story | insight | hot_take | emotional | other
-  virality: number;       // score 0–1 (normalised)
-  confidence: number;
+  worthy: number; // noul 0–1
+  contentType: string;
+  hook: number; // 0–1
+  standalone: number; // 0–1
+  payoff: number; // 0–1
+  composite: number; // weighted 0–1, this is what ranks
   cost: number;
 }
 
-// Final clip we return to the UI
 export interface Clip {
   title: string;
   startSeconds: number;
   endSeconds: number;
   reason: string;
-  hook: string;
-  viralityScore: number;
+  hook: string; // opening text excerpt
+  viralityScore: number; // composite 0–1 (name kept so the UI does not change)
+  scores: { hook: number; standalone: number; payoff: number };
   contentType: string;
 }
 
+const TYPE_LABELS: Record<string, string> = {
+  hook: "Strong hook",
+  story: "Compelling story",
+  insight: "Valuable insight",
+  hot_take: "Hot take",
+  emotional: "Emotionally resonant",
+  other: "Notable moment",
+};
+
+/* ---------- Parsing and segmentation ---------- */
+
+/** Parse "[M:SS] text" or "[H:MM:SS] text" lines. */
+function parseTranscript(transcript: string): Entry[] {
+  const entries: Entry[] = [];
+  for (const line of transcript.split("\n")) {
+    const m = line.trim().match(/^\[(?:(\d+):)?(\d+):(\d+)\]\s+(.*)$/);
+    if (!m) continue;
+    const [, h, mins, secs, text] = m;
+    entries.push({
+      seconds: Number(h ?? 0) * 3600 + Number(mins) * 60 + Number(secs),
+      text: (text ?? "").trim(),
+    });
+  }
+  return entries;
+}
+
+const wordCount = (s: string) => s.split(/\s+/).filter(Boolean).length;
+
 /**
- * Parse "[M:SS] text" lines into timed segments of ~30–60 seconds each.
+ * Indices where a natural break happens before entry i: the previous line ended
+ * a sentence, or the timestamp gap is longer than the speech would need.
+ * Auto-captions often lack punctuation, so fall back to every entry.
  */
-function segmentTranscript(transcript: string): Segment[] {
-  const lines = transcript.split("\n").filter(Boolean);
-
-  // Parse every timestamped line
-  const entries: { seconds: number; text: string }[] = [];
-  for (const line of lines) {
-    const match = line.match(/^\[(\d+):(\d+)\]\s+(.*)$/);
-    if (match) {
-      const [, mins, secs, text] = match;
-      entries.push({ seconds: Number(mins) * 60 + Number(secs), text: text ?? "" });
-    }
+function findBreaks(entries: Entry[]): number[] {
+  const idx = [0];
+  for (let i = 1; i < entries.length; i++) {
+    const prev = entries[i - 1]!;
+    const endsSentence = /[.!?]["')\]]?\s*$/.test(prev.text);
+    const gap = entries[i]!.seconds - prev.seconds;
+    const expected = wordCount(prev.text) / 2.8;
+    if (endsSentence || gap > expected + 1.5) idx.push(i);
   }
-
-  if (entries.length === 0) return [];
-
-  // Group into windows of ~40 seconds, minimum 15s
-  const TARGET_WINDOW = 40;
-  const MIN_WINDOW = 15;
-  const segments: Segment[] = [];
-  let windowStart = 0;
-
-  while (windowStart < entries.length) {
-    const startEntry = entries[windowStart]!;
-    const startSec = startEntry.seconds;
-    let windowEnd = windowStart;
-
-    // Grow window until we hit ~TARGET_WINDOW seconds or end of entries
-    while (
-      windowEnd < entries.length - 1 &&
-      (entries[windowEnd + 1]!.seconds - startSec) < TARGET_WINDOW
-    ) {
-      windowEnd++;
-    }
-
-    const endEntry = entries[windowEnd]!;
-    // Estimate real end = last entry time + a few seconds
-    const endSec = endEntry.seconds + 5;
-    const duration = endSec - startSec;
-
-    if (duration >= MIN_WINDOW) {
-      const text = entries.slice(windowStart, windowEnd + 1).map((e) => e.text).join(" ");
-      segments.push({ text, startSeconds: startSec, endSeconds: endSec });
-    }
-
-    // Advance to next window with 10s overlap for context
-    const overlapTarget = startSec + TARGET_WINDOW - 10;
-    let next = windowStart + 1;
-    while (next < entries.length - 1 && entries[next]!.seconds < overlapTarget) {
-      next++;
-    }
-    windowStart = next;
-  }
-
-  return segments;
+  const sparse = idx.length < Math.max(3, entries.length * 0.05);
+  return sparse ? entries.map((_, i) => i) : idx;
 }
 
 /**
- * Ask JEV about one segment via the Decisions API.
+ * Windows of several lengths that start and end on breaks, with context
+ * before and after. Stride widens on long videos to respect maxWindows.
  */
+function buildSegments(entries: Entry[]): Segment[] {
+  if (entries.length === 0) return [];
+
+  const first = entries[0]!.seconds;
+  const lastEnd = entries[entries.length - 1]!.seconds + 5;
+  const timeAt = (i: number) => (i >= entries.length ? lastEnd : entries[i]!.seconds);
+  const ctx = (from: number, to: number) =>
+    entries
+      .filter((e) => e.seconds >= from && e.seconds < to)
+      .map((e) => e.text)
+      .join(" ");
+
+  const starts = findBreaks(entries);
+  const ends = [...starts.filter((i) => i > 0), entries.length];
+  const stride = Math.max(
+    CFG.strideSeconds,
+    Math.ceil(((lastEnd - first) * CFG.windowLengths.length) / CFG.maxWindows)
+  );
+
+  const segments: Segment[] = [];
+  const seen = new Set<string>();
+  let nextStart = first;
+  let ep = 0;
+
+  for (const b of starts) {
+    const t0 = timeAt(b);
+    if (t0 < nextStart) continue;
+    nextStart = t0 + stride;
+    while (ep < ends.length && ends[ep]! <= b) ep++;
+
+    for (const len of CFG.windowLengths) {
+      let best = -1;
+      let bestDiff = Infinity;
+      for (let j = ep; j < ends.length; j++) {
+        const dur = timeAt(ends[j]!) - t0;
+        if (dur > len + CFG.snapTolerance) break;
+        const diff = Math.abs(dur - len);
+        if (diff <= CFG.snapTolerance && diff < bestDiff) {
+          best = ends[j]!;
+          bestDiff = diff;
+        }
+      }
+      if (best < 0) continue;
+
+      const key = `${b}-${best}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const endSec = timeAt(best);
+      const dur = endSec - t0;
+      if (dur < CFG.minClipSeconds || dur > CFG.maxClipSeconds) continue;
+
+      const text = entries.slice(b, best).map((e) => e.text).join(" ");
+      if (wordCount(text) < CFG.minWords) continue;
+
+      segments.push({
+        text,
+        startSeconds: t0,
+        endSeconds: endSec,
+        before: ctx(t0 - CFG.contextSeconds, t0).slice(-CFG.contextChars),
+        after: ctx(endSec, endSec + CFG.contextSeconds).slice(0, CFG.contextChars),
+      });
+    }
+  }
+  return segments;
+}
+
+/* ---------- Jev ---------- */
+
+const CTX_NOTE =
+  " Judge only transcript_segment. context_before and context_after are for reference.";
+
+function scoreQuestion(instructions: string, labels: string[]) {
+  return { type: "score" as const, instructions: instructions + CTX_NOTE, criteria: labels };
+}
+
 async function evaluateSegment(
   client: OpenRouter,
   segment: Segment,
-  videoId: string
+  videoId: string,
+  videoTitle: string
 ): Promise<SegmentDecision | null> {
   try {
     const decision = await client.alpha.decisions.create({
       decisionsRequest: {
         model: JEV_MODEL,
         state: {
+          video_title: videoTitle,
+          video_id: videoId,
           transcript_segment: segment.text,
           start_time_seconds: segment.startSeconds,
           end_time_seconds: segment.endSeconds,
-          video_id: videoId,
+          context_before: segment.before,
+          context_after: segment.after,
         },
         questions: {
           is_clip_worthy: {
             type: "noul",
-            instructions: "Is this transcript segment a strong candidate for a short-form viral clip (Reels, TikTok, YouTube Shorts)?",
+            instructions:
+              "Is this passage real content a viewer could follow, as opposed to filler?" + CTX_NOTE,
             criteria: {
-              true: "The segment has a clear hook, tells a compelling story, shares a hot take, delivers a surprising insight, or contains an emotional moment that would make viewers stop scrolling.",
-              false: "The segment is filler, transitions, introductions, sponsor reads, or dry content with no clear hook.",
+              true: "Substantive: a claim, story, explanation, argument, or moment.",
+              false: "Intro or outro, sponsor read, housekeeping, transitions, or dead air.",
             },
           },
           content_type: {
             type: "choice",
-            instructions: "What best describes the nature of this clip?",
+            instructions: "What best describes the nature of this passage?" + CTX_NOTE,
             criteria: {
               hook: "Opens with a strong question or surprising statement that grabs attention immediately.",
               story: "A personal anecdote or narrative with a clear arc.",
@@ -128,39 +229,73 @@ async function evaluateSegment(
               other: "None of the above.",
             },
           },
-          virality: {
-            type: "score",
-            instructions: "How likely is this clip to go viral on short-form video platforms?",
-            criteria: ["Would not perform", "Might get some views", "Strong performer", "Likely to go viral"],
-          },
+          hook_strength: scoreQuestion(
+            "How well do the first one or two sentences make a stranger keep watching?",
+            [
+              "Starts mid-thought or with filler",
+              "Weak or generic opening",
+              "Decent opening that raises some interest",
+              "Strong opening question, claim, or surprise",
+              "Arresting: a bold claim, surprising fact, or sharp question right away",
+            ]
+          ),
+          standalone: scoreQuestion(
+            "Would a viewer with no prior context understand and follow this passage?",
+            [
+              "Impossible to follow without earlier context",
+              "Mostly confusing",
+              "Understandable with some effort",
+              "Clear",
+              "Fully self-contained and clear",
+            ]
+          ),
+          payoff: scoreQuestion(
+            "Does the passage land a complete idea, punchline, or takeaway by its end?",
+            [
+              "Cuts off mid-thought",
+              "Trails off with no point",
+              "Reaches a partial point",
+              "Lands a clear point",
+              "Ends on a strong, memorable takeaway or punchline",
+            ]
+          ),
         },
       },
     });
 
-    const { is_clip_worthy, content_type, virality } = decision.answers;
+    const { is_clip_worthy, content_type, hook_strength, standalone, payoff } = decision.answers;
 
     if (
       is_clip_worthy.type !== "noul" ||
       content_type.type !== "choice" ||
-      virality.type !== "score"
+      hook_strength.type !== "score" ||
+      standalone.type !== "score" ||
+      payoff.type !== "score"
     ) {
       return null;
     }
 
-    // score is 0–3 (4 criteria labels), normalise to 0–1
-    const maxScore = 3;
-    const viralityNorm = Math.min(virality.score / maxScore, 1);
-    
-    // JEV costs $0.042 per 1M input tokens, 0 for output. 
-    // Fallback to manual calc if SDK cost is undefined.
+    const norm = (n: number) => Math.min(Math.max(n / (SCORE_LEVELS - 1), 0), 1);
+    const worthy = is_clip_worthy.noul;
+    const hook = norm(hook_strength.score);
+    const stand = norm(standalone.score);
+    const pay = norm(payoff.score);
+
+    // JEV costs $0.042 per 1M input tokens, 0 for output.
     const fallbackCost = (decision.usage.inputTokens / 1_000_000) * 0.042;
 
     return {
       segment,
-      isClipWorthy: is_clip_worthy.noul,
+      worthy,
       contentType: content_type.choice,
-      virality: viralityNorm,
-      confidence: content_type.confidence ?? 0,
+      hook,
+      standalone: stand,
+      payoff: pay,
+      composite:
+        WEIGHTS.hook * hook +
+        WEIGHTS.standalone * stand +
+        WEIGHTS.payoff * pay +
+        WEIGHTS.worthy * worthy,
       cost: decision.usage.cost ?? fallbackCost,
     };
   } catch (err) {
@@ -169,45 +304,132 @@ async function evaluateSegment(
   }
 }
 
-/**
- * Build a human-readable reason + hook from the decision data.
- */
-function buildClipMetadata(decision: SegmentDecision): Pick<Clip, "title" | "reason" | "hook"> {
-  const typeLabels: Record<string, string> = {
-    hook: "Strong hook",
-    story: "Compelling story",
-    insight: "Valuable insight",
-    hot_take: "Hot take",
-    emotional: "Emotionally resonant",
-    other: "Notable moment",
+/** Worker pool that stops taking new work at the deadline. */
+async function scoreAll(
+  items: Segment[],
+  fn: (s: Segment) => Promise<SegmentDecision | null>
+): Promise<{ decisions: SegmentDecision[]; truncated: boolean }> {
+  // Interleave so a timeout leaves coverage spread across the video, not just the start.
+  const order = [0, 1, 2, 3].flatMap((k) => items.filter((_, i) => i % 4 === k));
+  const deadline = Date.now() + CFG.budgetMs;
+  const decisions: SegmentDecision[] = [];
+  let next = 0;
+  let truncated = false;
+
+  const worker = async () => {
+    while (true) {
+      if (next >= order.length) return;
+      if (Date.now() > deadline) {
+        truncated = true;
+        return;
+      }
+      const seg = order[next++]!;
+      const d = await fn(seg);
+      if (d) decisions.push(d);
+    }
   };
 
-  const typeLabel = typeLabels[decision.contentType] ?? "Notable moment";
-  const viralPct = Math.round(decision.virality * 100);
-  const clipPct = Math.round(decision.isClipWorthy * 100);
+  await Promise.all(Array.from({ length: CFG.concurrency }, worker));
+  return { decisions, truncated };
+}
 
-  // Derive a title from the first sentence of the segment
-  const firstSentence = decision.segment.text.split(/[.!?]/)[0]?.trim() ?? "";
+/* ---------- Selection ---------- */
+
+interface Picked {
+  start: number;
+  end: number;
+  parts: SegmentDecision[];
+}
+
+function buildClipMetadata(
+  best: SegmentDecision,
+  text: string,
+  start: number
+): Pick<Clip, "title" | "reason" | "hook"> {
+  const label = TYPE_LABELS[best.contentType] ?? "Notable moment";
+  const n = (x: number) => Math.round(x * (SCORE_LEVELS - 1));
+  const max = SCORE_LEVELS - 1;
+
+  const firstSentence = text.split(/[.!?]/)[0]?.trim() ?? "";
   const title =
     firstSentence.length > 10 && firstSentence.length <= 60
       ? firstSentence
-      : `${typeLabel} (${formatTime(decision.segment.startSeconds)})`;
+      : `${label} (${formatTime(start)})`;
 
-  const reason = `${typeLabel} — JEV rated this ${clipPct}% clip-worthy with a ${viralPct}% virality score.`;
-  const hook = decision.segment.text.slice(0, 120).trim() + (decision.segment.text.length > 120 ? "…" : "");
-
+  const reason = `${label} — hook ${n(best.hook)}/${max}, standalone ${n(best.standalone)}/${max}, payoff ${n(best.payoff)}/${max}.`;
+  const hook = text.slice(0, 120).trim() + (text.length > 120 ? "…" : "");
   return { title, reason, hook };
+}
+
+/**
+ * Rank by composite, drop anything under the floor, suppress overlaps,
+ * and merge windows that touch into one longer clip.
+ */
+function selectClips(
+  decisions: SegmentDecision[],
+  textOf: (from: number, to: number) => string
+): Clip[] {
+  const ranked = decisions
+    .filter((d) => d.composite >= CFG.minScore && d.worthy >= CFG.minWorthy)
+    .sort((a, b) => b.composite - a.composite);
+
+  const picked: Picked[] = [];
+  for (const d of ranked) {
+    const s = d.segment.startSeconds;
+    const e = d.segment.endSeconds;
+    let handled = false;
+
+    for (const p of picked) {
+      const overlap = Math.max(0, Math.min(e, p.end) - Math.max(s, p.start));
+      const minDur = Math.min(e - s, p.end - p.start);
+      if (overlap / minDur > CFG.overlapLimit) {
+        handled = true; // too similar to something already picked
+        break;
+      }
+      const gap = Math.max(s, p.start) - Math.min(e, p.end);
+      const union = Math.max(e, p.end) - Math.min(s, p.start);
+      if (overlap === 0 && gap <= CFG.mergeGapSeconds && union <= CFG.maxClipSeconds) {
+        p.start = Math.min(s, p.start);
+        p.end = Math.max(e, p.end);
+        p.parts.push(d);
+        handled = true;
+        break;
+      }
+    }
+
+    if (!handled && picked.length < CFG.maxClips) {
+      picked.push({ start: s, end: e, parts: [d] });
+    }
+  }
+
+  return picked
+    .map((p): Clip => {
+      const best = p.parts.reduce((a, b) => (b.composite > a.composite ? b : a));
+      const meta = buildClipMetadata(best, textOf(p.start, p.end), p.start);
+      const r = (x: number) => Math.round(x * 100) / 100;
+      return {
+        ...meta,
+        startSeconds: p.start,
+        endSeconds: p.end,
+        viralityScore: r(best.composite),
+        scores: { hook: r(best.hook), standalone: r(best.standalone), payoff: r(best.payoff) },
+        contentType: best.contentType,
+      };
+    })
+    .sort((a, b) => a.startSeconds - b.startSeconds);
 }
 
 function formatTime(seconds: number): string {
   const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
+  const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+/* ---------- Route ---------- */
+
 export async function POST(request: Request) {
   try {
-    const { transcript, videoId } = await request.json();
+    const { transcript, videoId, videoTitle } = await request.json();
 
     if (!transcript || !videoId) {
       return Response.json({ error: "transcript and videoId are required" }, { status: 400 });
@@ -220,94 +442,51 @@ export async function POST(request: Request) {
 
     const client = new OpenRouter({ apiKey, serverURL: "https://openrouter.ai" });
 
-    // 1. Segment the transcript into timed windows
-    const segments = segmentTranscript(transcript);
+    // 1. Parse and build break-aligned windows with context
+    const entries = parseTranscript(transcript);
+    const segments = buildSegments(entries);
     if (segments.length === 0) {
       return Response.json({ error: "Could not parse transcript into segments" }, { status: 400 });
     }
 
-    // 2. Evaluate all segments with JEV in parallel (cap concurrency to avoid rate limits)
-    const CONCURRENCY = 5;
-    const decisions: SegmentDecision[] = [];
-
-    for (let i = 0; i < segments.length; i += CONCURRENCY) {
-      const batch = segments.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(
-        batch.map((seg) => evaluateSegment(client, seg, videoId))
-      );
-      for (const r of results) {
-        if (r !== null) decisions.push(r);
-      }
-    }
-
+    // 2. Score every window with Jev (worker pool, time-boxed)
+    const { decisions, truncated } = await scoreAll(segments, (seg) =>
+      evaluateSegment(client, seg, videoId, videoTitle ?? "")
+    );
     if (decisions.length === 0) {
       return Response.json({ error: "JEV could not evaluate any segments" }, { status: 502 });
     }
 
-    // Debug: log what JEV actually returned for every segment
-    console.log("[clips] JEV decisions for", decisions.length, "segments:");
-    for (const d of decisions) {
-      console.log(
-        `  [${formatTime(d.segment.startSeconds)}-${formatTime(d.segment.endSeconds)}]`,
-        `noul=${d.isClipWorthy.toFixed(2)}`,
-        `type=${d.contentType}`,
-        `virality=${d.virality.toFixed(2)}`
-      );
-    }
-
-    // 3. Sort by composite score: 60% virality + 40% clip-worthiness
-    //    No hard filter — always return the best segments JEV found
-    const ranked = [...decisions].sort((a, b) => {
-      const scoreA = 0.6 * a.virality + 0.4 * a.isClipWorthy;
-      const scoreB = 0.6 * b.virality + 0.4 * b.isClipWorthy;
-      return scoreB - scoreA;
-    });
-
-    // 4. Take top 6, deduplicate overlapping timestamps
-    const topClips: Clip[] = [];
-    for (const decision of ranked) {
-      if (topClips.length >= 6) break;
-
-      // Skip if this segment overlaps >50% with an already-selected clip
-      const overlaps = topClips.some((c) => {
-        const overlapStart = Math.max(c.startSeconds, decision.segment.startSeconds);
-        const overlapEnd = Math.min(c.endSeconds, decision.segment.endSeconds);
-        const overlapDuration = Math.max(0, overlapEnd - overlapStart);
-        const minDuration = Math.min(
-          c.endSeconds - c.startSeconds,
-          decision.segment.endSeconds - decision.segment.startSeconds
+    if (process.env.CLIPS_DEBUG) {
+      for (const d of [...decisions].sort((a, b) => b.composite - a.composite).slice(0, 25)) {
+        console.log(
+          `[clips] ${formatTime(d.segment.startSeconds)}-${formatTime(d.segment.endSeconds)}`,
+          `score=${d.composite.toFixed(2)} hook=${d.hook.toFixed(2)}`,
+          `stand=${d.standalone.toFixed(2)} pay=${d.payoff.toFixed(2)}`,
+          `worthy=${d.worthy.toFixed(2)} type=${d.contentType}`
         );
-        return minDuration > 0 && overlapDuration / minDuration > 0.5;
-      });
-
-      if (!overlaps) {
-        const { title, reason, hook } = buildClipMetadata(decision);
-        topClips.push({
-          title,
-          startSeconds: decision.segment.startSeconds,
-          endSeconds: decision.segment.endSeconds,
-          reason,
-          hook,
-          viralityScore: decision.virality,
-          contentType: decision.contentType,
-        });
       }
     }
 
-    if (topClips.length === 0) {
-      return Response.json(
-        { error: "No segments were produced from the transcript. The video may be too short or have no parseable captions." },
-        { status: 404 }
-      );
-    }
+    // 3. Floor, overlap suppression, merge adjacent, top N
+    const textOf = (from: number, to: number) =>
+      entries
+        .filter((e) => e.seconds >= from && e.seconds < to)
+        .map((e) => e.text)
+        .join(" ");
+    const clips = selectClips(decisions, textOf);
 
-    // Sort final clips chronologically for display
-    topClips.sort((a, b) => a.startSeconds - b.startSeconds);
-
-    // Calculate total cost
     const totalCost = decisions.reduce((acc, d) => acc + d.cost, 0);
 
-    return Response.json({ clips: topClips, videoId, totalCost });
+    return Response.json({
+      clips,
+      videoId,
+      totalCost,
+      windowsScored: decisions.length,
+      windowsTotal: segments.length,
+      truncated,
+      ...(clips.length === 0 && { message: "No strong clips found in this video." }),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error("[clips] Error:", err);
