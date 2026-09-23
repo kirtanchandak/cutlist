@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { track } from "@vercel/analytics";
 import { extractVideoId } from "./lib/utils";
 import { WaitlistForm } from "./components/WaitlistForm";
 import { supabase } from "./lib/supabase";
@@ -35,6 +36,7 @@ export default function Home() {
       return;
     }
 
+    track("find_clips", { video_id: id });
     router.push(`/v/${id}`);
   }, [url, router]);
 

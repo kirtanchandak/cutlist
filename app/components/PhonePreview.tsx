@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { track } from "@vercel/analytics";
 import { Loader2 } from "lucide-react";
 import clsx from "clsx";
 
@@ -47,7 +48,7 @@ export function PhonePreview({ clip, videoId, dlStatus, totalDuration }: PhonePr
     setExporting(true);
     setExportError(null);
     try {
-      // Analytics: Track export
+      track("clip_export", { video_id: videoId, aspect_ratio: aspectRatio });
       supabase.from("clip_exports").insert([{ video_id: videoId, aspect_ratio: aspectRatio }]).then(({ error }) => {
         if (error) console.error(error);
       });

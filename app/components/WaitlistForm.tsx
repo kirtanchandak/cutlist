@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { track } from "@vercel/analytics";
 import { supabase } from "../lib/supabase";
 import clsx from "clsx";
 
@@ -19,6 +20,7 @@ export function WaitlistForm() {
       if (error && error.code !== "23505") { // Ignore unique violation
         throw error;
       }
+      track("waitlist_join");
       setStatus("success");
     } catch (err) {
       console.error(err);
