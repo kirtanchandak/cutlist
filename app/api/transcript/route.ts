@@ -1,5 +1,15 @@
-import { YouTubeTranscriptApi } from "youtube-transcript-nodejs";
+import { YouTubeTranscriptApi, AutoPoTokenProvider } from "youtube-transcript-nodejs";
 import { extractVideoId } from "../../lib/utils";
+
+// Reuse the PoToken provider across requests for caching
+let poTokenProvider: InstanceType<typeof AutoPoTokenProvider> | null = null;
+
+function getPoTokenProvider() {
+  if (!poTokenProvider) {
+    poTokenProvider = new AutoPoTokenProvider();
+  }
+  return poTokenProvider;
+}
 
 export async function POST(request: Request) {
   try {
@@ -21,6 +31,8 @@ export async function POST(request: Request) {
     }
 
     const api = new YouTubeTranscriptApi();
+    api.setPoTokenProvider(getPoTokenProvider());
+
     const transcriptList = await api.list(videoId);
     // Find the best English transcript (manual or auto-generated)
     const transcriptData = transcriptList.findTranscript(['en']);
