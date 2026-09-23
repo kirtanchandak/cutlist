@@ -95,7 +95,22 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
 
   // Main processing logic
   useEffect(() => {
+    const abortController = new AbortController();
     let isCancelled = false;
+
+    async function fetchWithRetry(url: string, options: RequestInit, retries = 3): Promise<Response> {
+      for (let i = 0; i < retries; i++) {
+        const res = await fetch(url, options);
+        if (res.status === 429 && i < retries - 1) {
+          // Rate limited — wait and retry with exponential backoff
+          await new Promise((r) => setTimeout(r, 2000 * (i + 1)));
+          if (isCancelled) throw new DOMException("Aborted", "AbortError");
+          continue;
+        }
+        return res;
+      }
+      return fetch(url, options); // final attempt
+    }
 
     async function processVideo() {
       try {
@@ -104,10 +119,12 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         
         // Step 1: Fetch transcript
         await new Promise((r) => setTimeout(r, 400));
-        const tRes = await fetch("/api/transcript", {
+        if (isCancelled) return;
+        const tRes = await fetchWithRetry("/api/transcript", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoUrl: videoId }), // extractVideoId treats this correctly
+          body: JSON.stringify({ videoUrl: videoId }),
+          signal: abortController.signal,
         });
         const tData = await tRes.json();
         if (!tRes.ok) throw new Error(tData.error || "Failed to fetch transcript");
@@ -119,10 +136,12 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         // Step 2: JEV analysis
         setLoadingStep(1);
         await new Promise((r) => setTimeout(r, 200));
+        if (isCancelled) return;
         const cRes = await fetch("/api/clips", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ transcript: tData.transcript, videoId: tData.videoId }),
+          signal: abortController.signal,
         });
         const cData = await cRes.json();
         if (isCancelled) return;
@@ -130,13 +149,13 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         // Step 3: Done
         setLoadingStep(2);
         await new Promise((r) => setTimeout(r, 400));
-
-        if (!cRes.ok) throw new Error(cData.error || "JEV failed to find clips");
         if (isCancelled) return;
 
-        setClips(cData.clips);
+        if (!cRes.ok) throw new Error(cData.error || "JEV failed to find clips");
+
+        setClips(cData.clips ?? []);
         setTotalCost(cData.totalCost);
-        setActiveClipIndex(0);
+        setActiveClipIndex(cData.clips?.length ? 0 : null);
         setSection(3);
         // Trigger background download only if <= 10 mins and downloads are enabled
         const downloadsDisabled = process.env.NEXT_PUBLIC_DISABLE_DOWNLOADS === "true";
@@ -149,10 +168,11 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         }
 
       } catch (err) {
-        if (!isCancelled) {
-          setError(err instanceof Error ? err.message : "Something went wrong");
-          setSection("error");
-        }
+        if (isCancelled) return;
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (err instanceof Error && err.name === "AbortError") return;
+        setError(err instanceof Error ? err.message : "Something went wrong");
+        setSection("error");
       }
     }
 
@@ -160,6 +180,7 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
 
     return () => {
       isCancelled = true;
+      abortController.abort();
     };
   }, [videoId]);
 
@@ -242,6 +263,24 @@ export default function WorkspacePage({ params }: { params: Promise<{ id: string
         )}
 
         {/* ─── SECTION 3: Workspace ─── */}
+        {section === 3 && clips.length === 0 && (
+          <section className="pt-[12vh] max-w-[560px]">
+            <h2 className="text-[34px] tracking-[-0.03em] font-extrabold mb-4">
+              No strong clips found
+            </h2>
+            <p className="text-lg text-[var(--mu)] mb-8">
+              Jev finished reading this video but didn&apos;t find a moment that scored high enough to clip.
+            </p>
+            <a
+              href="/"
+              className="px-7 py-3 font-semibold text-base transition-colors rounded-xl inline-block"
+              style={{ background: "var(--ink)", color: "var(--bg)" }}
+            >
+              Try another video
+            </a>
+          </section>
+        )}
+
         {section === 3 && clips.length > 0 && (
           <section>
             {/* Title bar */}
