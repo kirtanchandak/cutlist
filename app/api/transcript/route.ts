@@ -1,4 +1,4 @@
-import { YoutubeTranscript } from "youtube-transcript";
+import { YouTubeTranscriptApi } from "youtube-transcript-nodejs";
 import { extractVideoId } from "../../lib/utils";
 
 export async function POST(request: Request) {
@@ -20,7 +20,14 @@ export async function POST(request: Request) {
       );
     }
 
-    const transcriptEntries = await YoutubeTranscript.fetchTranscript(videoId);
+    const api = new YouTubeTranscriptApi();
+    const transcriptList = await api.list(videoId);
+    // Find the best English transcript (manual or auto-generated)
+    const transcriptData = transcriptList.findTranscript(['en']);
+    if (!transcriptData) {
+      throw new Error("No English transcript found");
+    }
+    const transcriptEntries = await transcriptData.fetch();
 
     if (!transcriptEntries || transcriptEntries.length === 0) {
       return Response.json(
@@ -30,8 +37,8 @@ export async function POST(request: Request) {
     }
 
     // Build structured lines for the UI
-    const lines = transcriptEntries.map((entry) => {
-      const seconds = Math.floor(entry.offset / 1000);
+    const lines = transcriptEntries.map((entry: any) => {
+      const seconds = Math.floor(entry.start);
       return { seconds, text: entry.text };
     });
 
@@ -45,9 +52,9 @@ export async function POST(request: Request) {
       .join("\n");
 
     // Estimate total video duration from last entry
-    const lastEntry = transcriptEntries[transcriptEntries.length - 1];
+    const lastEntry = (transcriptEntries as any)[transcriptEntries.length - 1];
     const totalDuration = lastEntry
-      ? Math.floor(lastEntry.offset / 1000) + Math.ceil((lastEntry.duration ?? 5000) / 1000)
+      ? Math.floor(lastEntry.start) + Math.ceil(lastEntry.duration ?? 5)
       : 0;
 
     return Response.json({ transcript, lines, videoId, totalDuration });
